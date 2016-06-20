@@ -26,12 +26,14 @@ import org.apache.tomcat.jni.Pool;
 import org.apache.tomcat.jni.SSL;
 import org.apache.tomcat.jni.SSLContext;
 
-import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509ExtendedTrustManager;
+import javax.net.ssl.X509KeyManager;
 import javax.net.ssl.X509TrustManager;
 import java.security.PrivateKey;
 import java.security.cert.Certificate;
@@ -55,7 +57,7 @@ public abstract class OpenSslContext extends SslContext {
      * To make it easier for users to replace JDK implemention with OpenSsl version we also use
      * {@code jdk.tls.rejectClientInitiatedRenegotiation} to allow disabling client initiated renegotiation.
      * Java8+ uses this system property as well.
-     *
+     * <p>
      * See also <a href="http://blog.ivanristic.com/2014/03/ssl-tls-improvements-in-java-8.html">
      * Significant SSL/TLS improvements in Java 8</a>
      */
@@ -66,20 +68,23 @@ public abstract class OpenSslContext extends SslContext {
     // TODO: Maybe make configurable ?
     protected static final int VERIFY_DEPTH = 10;
 
-    /** The OpenSSL SSL_CTX object */
+    /**
+     * The OpenSSL SSL_CTX object
+     */
     protected volatile long ctx;
-    final OpenSslEngineMap engineMap = new DefaultOpenSslEngineMap();
     long aprPool;
     @SuppressWarnings({ "unused", "FieldMayBeFinal" })
     private volatile int aprPoolDestroyed;
-    private volatile boolean rejectRemoteInitiatedRenegotiation;
     private final List<String> unmodifiableCiphers;
     private final long sessionCacheSize;
     private final long sessionTimeout;
     private final OpenSslApplicationProtocolNegotiator apn;
     private final int mode;
-    private final Certificate[] keyCertChain;
-    private final ClientAuth clientAuth;
+
+    final Certificate[] keyCertChain;
+    final ClientAuth clientAuth;
+    final OpenSslEngineMap engineMap = new DefaultOpenSslEngineMap();
+    volatile boolean rejectRemoteInitiatedRenegotiation;
 
     static final OpenSslApplicationProtocolNegotiator NONE_PROTOCOL_NEGOTIATOR =
             new OpenSslApplicationProtocolNegotiator() {
@@ -153,7 +158,7 @@ public abstract class OpenSslContext extends SslContext {
             convertedCiphers = null;
         } else {
             convertedCiphers = new ArrayList<String>();
-            for (String c: ciphers) {
+            for (String c : ciphers) {
                 if (c == null) {
                     break;
                 }
@@ -218,18 +223,18 @@ public abstract class OpenSslContext extends SslContext {
                     int selectorBehavior = opensslSelectorFailureBehavior(apn.selectorFailureBehavior());
 
                     switch (apn.protocol()) {
-                    case NPN:
-                        SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
-                        break;
-                    case ALPN:
-                        SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
-                        break;
-                    case NPN_AND_ALPN:
-                        SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
-                        SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
-                        break;
-                    default:
-                        throw new Error();
+                        case NPN:
+                            SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
+                            break;
+                        case ALPN:
+                            SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
+                            break;
+                        case NPN_AND_ALPN:
+                            SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
+                            SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
+                            break;
+                        default:
+                            throw new Error();
                     }
                 }
 
@@ -265,12 +270,12 @@ public abstract class OpenSslContext extends SslContext {
 
     private static int opensslSelectorFailureBehavior(SelectorFailureBehavior behavior) {
         switch (behavior) {
-        case NO_ADVERTISE:
-            return SSL.SSL_SELECTOR_FAILURE_NO_ADVERTISE;
-        case CHOOSE_MY_LAST_PROTOCOL:
-            return SSL.SSL_SELECTOR_FAILURE_CHOOSE_MY_LAST_PROTOCOL;
-        default:
-            throw new Error();
+            case NO_ADVERTISE:
+                return SSL.SSL_SELECTOR_FAILURE_NO_ADVERTISE;
+            case CHOOSE_MY_LAST_PROTOCOL:
+                return SSL.SSL_SELECTOR_FAILURE_CHOOSE_MY_LAST_PROTOCOL;
+            default:
+                throw new Error();
         }
     }
 
@@ -301,9 +306,10 @@ public abstract class OpenSslContext extends SslContext {
 
     @Override
     public final SSLEngine newEngine(ByteBufAllocator alloc, String peerHost, int peerPort) {
-        return new OpenSslEngine(ctx, alloc, isClient(), sessionContext(), apn, engineMap,
-                rejectRemoteInitiatedRenegotiation, peerHost, peerPort, keyCertChain, clientAuth);
+        return new OpenSslEngine(this, alloc, peerHost, peerPort);
     }
+
+    abstract OpenSslKeyMaterialManager keyMaterialManager();
 
     /**
      * Returns a new server-side {@link SSLEngine} with the current configuration.
@@ -327,6 +333,7 @@ public abstract class OpenSslContext extends SslContext {
 
     /**
      * Returns the stats of this context.
+     *
      * @deprecated use {@link #sessionContext#stats()}
      */
     @Deprecated
@@ -351,6 +358,7 @@ public abstract class OpenSslContext extends SslContext {
 
     /**
      * Sets the SSL session ticket keys of this context.
+     *
      * @deprecated use {@link OpenSslSessionContext#setTicketKeys(byte[])}
      */
     @Deprecated
@@ -405,9 +413,19 @@ public abstract class OpenSslContext extends SslContext {
         throw new IllegalStateException("no X509TrustManager found");
     }
 
+    protected static X509KeyManager chooseX509KeyManager(KeyManager[] kms) {
+        for (KeyManager km : kms) {
+            if (km instanceof X509KeyManager) {
+                return (X509KeyManager) km;
+            }
+        }
+        throw new IllegalStateException("no X509KeyManager found");
+    }
+
     /**
      * Translate a {@link ApplicationProtocolConfig} object to a
      * {@link OpenSslApplicationProtocolNegotiator} object.
+     *
      * @param config The configuration which defines the translation
      * @return The results of the translation
      */
@@ -417,38 +435,42 @@ public abstract class OpenSslContext extends SslContext {
         }
 
         switch (config.protocol()) {
-        case NONE:
-            return NONE_PROTOCOL_NEGOTIATOR;
-        case ALPN:
-        case NPN:
-        case NPN_AND_ALPN:
-            switch (config.selectedListenerFailureBehavior()) {
-            case CHOOSE_MY_LAST_PROTOCOL:
-            case ACCEPT:
-                switch (config.selectorFailureBehavior()) {
-                case CHOOSE_MY_LAST_PROTOCOL:
-                case NO_ADVERTISE:
-                    return new OpenSslDefaultApplicationProtocolNegotiator(
-                            config);
-                default:
-                    throw new UnsupportedOperationException(
-                            new StringBuilder("OpenSSL provider does not support ")
-                                    .append(config.selectorFailureBehavior())
-                                    .append(" behavior").toString());
+            case NONE:
+                return NONE_PROTOCOL_NEGOTIATOR;
+            case ALPN:
+            case NPN:
+            case NPN_AND_ALPN:
+                switch (config.selectedListenerFailureBehavior()) {
+                    case CHOOSE_MY_LAST_PROTOCOL:
+                    case ACCEPT:
+                        switch (config.selectorFailureBehavior()) {
+                            case CHOOSE_MY_LAST_PROTOCOL:
+                            case NO_ADVERTISE:
+                                return new OpenSslDefaultApplicationProtocolNegotiator(
+                                        config);
+                            default:
+                                throw new UnsupportedOperationException(
+                                        new StringBuilder("OpenSSL provider does not support ")
+                                                .append(config.selectorFailureBehavior())
+                                                .append(" behavior").toString());
+                        }
+                    default:
+                        throw new UnsupportedOperationException(
+                                new StringBuilder("OpenSSL provider does not support ")
+                                        .append(config.selectedListenerFailureBehavior())
+                                        .append(" behavior").toString());
                 }
             default:
-                throw new UnsupportedOperationException(
-                        new StringBuilder("OpenSSL provider does not support ")
-                                .append(config.selectedListenerFailureBehavior())
-                                .append(" behavior").toString());
-            }
-        default:
-            throw new Error();
+                throw new Error();
         }
     }
 
     static boolean useExtendedTrustManager(X509TrustManager trustManager) {
-         return PlatformDependent.javaVersion() >= 7 && trustManager instanceof X509ExtendedTrustManager;
+        return PlatformDependent.javaVersion() >= 7 && trustManager instanceof X509ExtendedTrustManager;
+    }
+
+    static boolean useExtendedKeyManager(X509KeyManager keyManager) {
+        return PlatformDependent.javaVersion() >= 7 && keyManager instanceof X509ExtendedKeyManager;
     }
 
     abstract static class AbstractCertificateVerifier implements CertificateVerifier {
@@ -461,7 +483,7 @@ public abstract class OpenSslContext extends SslContext {
         @Override
         public final int verify(long ssl, byte[][] chain, String auth) {
             X509Certificate[] peerCerts = certificates(chain);
-            final OpenSslEngine engine = engineMap.remove(ssl);
+            final OpenSslEngine engine = engineMap.get(ssl);
             try {
                 verify(engine, peerCerts, auth);
                 return CertificateVerifier.X509_V_OK;
@@ -492,6 +514,7 @@ public abstract class OpenSslContext extends SslContext {
 
     private static final class DefaultOpenSslEngineMap implements OpenSslEngineMap {
         private final Map<Long, OpenSslEngine> engines = PlatformDependent.newConcurrentHashMap();
+
         @Override
         public OpenSslEngine remove(long ssl) {
             return engines.remove(ssl);
@@ -500,6 +523,11 @@ public abstract class OpenSslContext extends SslContext {
         @Override
         public void add(OpenSslEngine engine) {
             engines.put(engine.sslPointer(), engine);
+        }
+
+        @Override
+        public OpenSslEngine get(long ssl) {
+            return engines.get(ssl);
         }
     }
 
@@ -584,13 +612,6 @@ public abstract class OpenSslContext extends SslContext {
             return bio;
         } finally {
             buffer.release();
-        }
-    }
-
-    static void checkKeyManagerFactory(KeyManagerFactory keyManagerFactory) {
-        if (keyManagerFactory != null) {
-            throw new IllegalArgumentException(
-                    "KeyManagerFactory is currently not supported with OpenSslContext");
         }
     }
 }
