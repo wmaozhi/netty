@@ -22,6 +22,8 @@ import io.netty.channel.MultithreadEventLoopGroup;
 import io.netty.channel.SelectStrategyFactory;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.EventExecutorChooserFactory;
+import io.netty.util.concurrent.RejectedExecutionHandler;
+import io.netty.util.concurrent.RejectedExecutionHandlers;
 
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadFactory;
@@ -107,6 +109,12 @@ public final class EpollEventLoopGroup extends MultithreadEventLoopGroup {
         super(nThreads, executor, chooserFactory, 0, selectStrategyFactory);
     }
 
+    public EpollEventLoopGroup(int nThreads, Executor executor, EventExecutorChooserFactory chooserFactory,
+                               SelectStrategyFactory selectStrategyFactory,
+                               RejectedExecutionHandler rejectedExecutionHandler) {
+        super(nThreads, executor, chooserFactory, 0, selectStrategyFactory, rejectedExecutionHandler);
+    }
+
     /**
      * Sets the percentage of the desired amount of time spent for I/O in the child event loops.  The default value is
      * {@code 50}, which means the event loop will try to spend the same amount of time for I/O as for non-I/O tasks.
@@ -119,7 +127,10 @@ public final class EpollEventLoopGroup extends MultithreadEventLoopGroup {
 
     @Override
     protected EventLoop newChild(Executor executor, Object... args) throws Exception {
+        final RejectedExecutionHandler rejectedExecutionHandler = args.length >= 3 ?
+                (RejectedExecutionHandler) args[2] : RejectedExecutionHandlers.reject();
+
         return new EpollEventLoop(this, executor, (Integer) args[0],
-                ((SelectStrategyFactory) args[1]).newSelectStrategy());
+                ((SelectStrategyFactory) args[1]).newSelectStrategy(), rejectedExecutionHandler);
     }
 }

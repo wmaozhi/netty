@@ -48,6 +48,16 @@ public final class DefaultEventExecutor extends SingleThreadEventExecutor {
         super(parent, executor, true);
     }
 
+    public DefaultEventExecutor(EventExecutorGroup parent, ThreadFactory threadFactory,
+                                RejectedExecutionHandler rejectedExecutionHandler) {
+        super(parent, threadFactory, true, rejectedExecutionHandler);
+    }
+
+    public DefaultEventExecutor(EventExecutorGroup parent, Executor executor,
+                                RejectedExecutionHandler rejectedExecutionHandler) {
+        super(parent, executor, true, rejectedExecutionHandler);
+    }
+
     @Override
     protected void run() {
         for (;;) {

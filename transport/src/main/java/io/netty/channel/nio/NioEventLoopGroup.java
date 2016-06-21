@@ -22,6 +22,8 @@ import io.netty.channel.MultithreadEventLoopGroup;
 import io.netty.channel.SelectStrategyFactory;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.EventExecutorChooserFactory;
+import io.netty.util.concurrent.RejectedExecutionHandler;
+import io.netty.util.concurrent.RejectedExecutionHandlers;
 
 import java.nio.channels.Selector;
 import java.nio.channels.spi.SelectorProvider;
@@ -91,6 +93,13 @@ public class NioEventLoopGroup extends MultithreadEventLoopGroup {
         super(nThreads, executor, chooserFactory, selectorProvider, selectStrategyFactory);
     }
 
+    public NioEventLoopGroup(int nThreads, Executor executor, EventExecutorChooserFactory chooserFactory,
+                             final SelectorProvider selectorProvider,
+                             final SelectStrategyFactory selectStrategyFactory,
+                             final RejectedExecutionHandler rejectedExecutionHandler) {
+        super(nThreads, executor, chooserFactory, selectorProvider, selectStrategyFactory, rejectedExecutionHandler);
+    }
+
     /**
      * Sets the percentage of the desired amount of time spent for I/O in the child event loops.  The default value is
      * {@code 50}, which means the event loop will try to spend the same amount of time for I/O as for non-I/O tasks.
@@ -113,7 +122,10 @@ public class NioEventLoopGroup extends MultithreadEventLoopGroup {
 
     @Override
     protected EventLoop newChild(Executor executor, Object... args) throws Exception {
+final RejectedExecutionHandler rejectedExecutionHandler = args.length >= 3 ?
+                (RejectedExecutionHandler) args[2] : RejectedExecutionHandlers.reject();
+
         return new NioEventLoop(this, executor, (SelectorProvider) args[0],
-            ((SelectStrategyFactory) args[1]).newSelectStrategy());
+            ((SelectStrategyFactory) args[1]).newSelectStrategy(), rejectedExecutionHandler);
     }
 }
