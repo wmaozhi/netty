@@ -23,7 +23,6 @@ import java.util.concurrent.ThreadFactory;
  * to handle the tasks.
  */
 public class DefaultEventExecutorGroup extends MultithreadEventExecutorGroup {
-
     /**
      * @see {@link #DefaultEventExecutorGroup(int, ThreadFactory)}
      */
@@ -38,11 +37,21 @@ public class DefaultEventExecutorGroup extends MultithreadEventExecutorGroup {
      * @param threadFactory     the ThreadFactory to use, or {@code null} if the default should be used.
      */
     public DefaultEventExecutorGroup(int nThreads, ThreadFactory threadFactory) {
-        super(nThreads, threadFactory);
+        this(nThreads, threadFactory, DefaultEventExecutor.DEFAULT_MAX_PENDING_TASKS);
+    }
+
+    /**
+     * Create a new instance.
+     *
+     * @param nThreads          the number of threads that will be used by this instance.
+     * @param threadFactory     the ThreadFactory to use, or {@code null} if the default should be used.
+     */
+    public DefaultEventExecutorGroup(int nThreads, ThreadFactory threadFactory, int maxPendingTasks) {
+        super(nThreads, threadFactory, maxPendingTasks);
     }
 
     @Override
     protected EventExecutor newChild(Executor executor, Object... args) throws Exception {
-        return new DefaultEventExecutor(this, executor);
+        return new DefaultEventExecutor(this, executor, (Integer) args[0]);
     }
 }

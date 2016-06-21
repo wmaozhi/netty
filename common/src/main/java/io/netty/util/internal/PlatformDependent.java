@@ -727,7 +727,15 @@ public final class PlatformDependent {
      * consumer (one thread!).
      */
     public static <T> Queue<T> newMpscQueue() {
-        return hasUnsafe() ? new MpscChunkedArrayQueue<T>(1024, MAX_MPSC_CAPACITY, true)
+        return newMpscQueue(MAX_MPSC_CAPACITY);
+    }
+
+    /**
+     * Create a new {@link Queue} which is safe to use for multiple producers (different threads) and a single
+     * consumer (one thread!).
+     */
+    public static <T> Queue<T> newMpscQueue(int maxCapacity) {
+        return hasUnsafe() ? new MpscChunkedArrayQueue<T>(1024, maxCapacity, true)
                 : new MpscLinkedAtomicQueue<T>();
     }
 
