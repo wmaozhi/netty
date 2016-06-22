@@ -20,6 +20,7 @@ import io.netty.util.internal.ObjectUtil;
 
 import java.util.Queue;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 
 /**
@@ -95,7 +96,9 @@ public abstract class SingleThreadEventLoop extends SingleThreadEventExecutor im
             reject();
         }
 
-        tailTasks.add(task);
+        if (!tailTasks.offer(task)) {
+            throw new RejectedExecutionException();
+        }
 
         if (wakesUpForTask(task)) {
             wakeup(inEventLoop());

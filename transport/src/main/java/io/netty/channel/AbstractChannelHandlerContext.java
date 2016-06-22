@@ -25,15 +25,18 @@ import io.netty.util.ResourceLeakHint;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.internal.ThrowableUtils;
 import io.netty.util.internal.ObjectUtil;
+import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.net.SocketAddress;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
-        implements ChannelHandlerContext, ResourceLeakHint {
+        implements ChannelHandlerContext, ResourceLeakHint, Runnable {
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(AbstractChannelHandlerContext.class);
     volatile AbstractChannelHandlerContext next;
@@ -70,6 +73,24 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
     private Runnable invokeReadTask;
     private Runnable invokeChannelWritableStateChangedTask;
     private Runnable invokeFlushTask;
+
+    private static final AtomicIntegerFieldUpdater<AbstractChannelHandlerContext> WRITE_PENDING_UPDATER;
+    @SuppressWarnings("unused")
+    private volatile int writePending;
+
+    // Keeps track if a flush is pending by the previous handler. This is needed so we not schedule multiple flushes
+    // when the write was done by a previous handler in the pipeline or the channel / pipeline itself.
+    private volatile boolean flushPending;
+
+    static {
+        AtomicIntegerFieldUpdater<AbstractChannelHandlerContext> writePendingUpdater =
+                PlatformDependent.newAtomicIntegerFieldUpdater(AbstractChannelHandlerContext.class, "writePending");
+        if (writePendingUpdater == null) {
+            writePendingUpdater = AtomicIntegerFieldUpdater.newUpdater(
+                    AbstractChannelHandlerContext.class, "writePending");
+        }
+        WRITE_PENDING_UPDATER = writePendingUpdater;
+    }
 
     AbstractChannelHandlerContext(DefaultChannelPipeline pipeline, EventExecutor executor, String name,
                                   boolean inbound, boolean outbound) {
@@ -717,7 +738,8 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         return promise;
     }
 
-    private void invokeWrite(Object msg, ChannelPromise promise) {
+    private void invokeWrite(Object msg, ChannelPromise promise, boolean flushPending) {
+        this.flushPending = flushPending;
         if (isAdded()) {
             invokeWrite0(msg, promise);
         } else {
@@ -735,6 +757,9 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
 
     @Override
     public ChannelHandlerContext flush() {
+        // We explicitly requested a flush so the flush is not pending anymore
+        flushPending = false;
+
         final AbstractChannelHandlerContext next = findContextOutbound();
         EventExecutor executor = next.executor();
         if (executor.inEventLoop()) {
@@ -802,23 +827,84 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         final Object m = pipeline.touch(msg, next);
         EventExecutor executor = next.executor();
         if (executor.inEventLoop()) {
-            if (flush) {
+            writeFromInsideEventLoop(next, m, flush, promise);
+        } else {
+            writeFromOutsideEventLoop(next, executor, m, flush, promise);
+        }
+    }
+
+    private void writeFromInsideEventLoop(AbstractChannelHandlerContext next, Object m,
+                                          boolean flush, ChannelPromise promise) {
+        if (flush) {
+            next.invokeWriteAndFlush(m, promise);
+        } else if (isAutoFlush()) {
+            if (!(executor() instanceof SingleThreadEventLoop)) {
+                // The Executor is not of type SingleThreadEventLoop which means we have no way to schedule a
+                // flush at the end of the event loop run. Just explicitly do a flush in this case.
                 next.invokeWriteAndFlush(m, promise);
             } else {
-                next.invokeWrite(m, promise);
+                // Only schedule if there is no other flush pending yet.
+                if (!flushPending) {
+                    // First schedule it so if the scheduling throws any exception it will be propergated to
+                    // the promise and release te message.
+                    try {
+                        scheduleFlushOnEventLoopIteration();
+                    } catch (RejectedExecutionException e) {
+                        try {
+                            // If it was rejected but the promise is already completed we not care too much, otherwise
+                            // release the message.
+                            promise.setFailure(e);
+                        } finally {
+                            ReferenceCountUtil.release(m);
+                        }
+                        return;
+                    }
+                }
+                // We scheduled a flush so now one is pending.
+                next.invokeWrite(m, promise, true);
             }
         } else {
-            AbstractWriteTask task;
-            if (flush) {
-                task = WriteAndFlushTask.newInstance(next, m, promise);
-            }  else {
-                task = WriteTask.newInstance(next, m, promise);
-            }
-            safeExecute(executor, task, promise, m);
-            if (!flush) {
-                pipeline.wakeUpForAutoFlushIfRequired();
-            }
+            next.invokeWrite(m, promise, false);
         }
+    }
+
+    private void writeFromOutsideEventLoop(AbstractChannelHandlerContext next, EventExecutor executor, Object m,
+                                           boolean flush, ChannelPromise promise) {
+        if (flush) {
+            safeExecute(executor, WriteAndFlushTask.newInstance(next, m, promise, false), promise, m);
+        } else if (isAutoFlush()) {
+            if (!(executor() instanceof SingleThreadEventLoop)) {
+                // The Executor is not of type SingleThreadEventLoop which means we have no way to schedule a
+                // flush at the end of the event loop run. Just explicitly do a flush in this case.
+                safeExecute(executor, WriteAndFlushTask.newInstance(next, m, promise, true), promise, m);
+            } else {
+                // We first add the write task and then schedule something on the loop if needed. This is done
+                // so we are sure we not miss the flush. We will explicit handle the case of
+                // RejectedExecutionException in this case.
+                safeExecute(executor, WriteTask.newInstance(next, m, promise, true), promise, m);
+
+                // Only schedule if there is no other flush pending yet.
+                if (!flushPending) {
+                    try {
+                        scheduleFlushOnEventLoopIteration();
+                    } catch (RejectedExecutionException e) {
+                        // If it was rejected but the promise is already completed we not care too much, otherwise
+                        // release the message.
+                        if (promise.tryFailure(e)) {
+                            ReferenceCountUtil.release(m);
+                        }
+                    }
+                }
+            }
+        } else {
+            safeExecute(executor, WriteTask.newInstance(next, m, promise, false), promise, m);
+        }
+    }
+
+    private boolean isAutoFlush() {
+        // Check for null to not produce a NPE if the ChannelConfig implementation not supports the ChannelOption.
+        Boolean autoFlush = channel().config().getOption(ChannelOption.AUTO_FLUSH);
+        return autoFlush != null ? autoFlush : false;
     }
 
     @Override
@@ -1022,6 +1108,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         private Object msg;
         private ChannelPromise promise;
         private int size;
+        private boolean autoFlush;
 
         @SuppressWarnings("unchecked")
         private AbstractWriteTask(Recycler.Handle<? extends AbstractWriteTask> handle) {
@@ -1029,10 +1116,11 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         }
 
         protected static void init(AbstractWriteTask task, AbstractChannelHandlerContext ctx,
-                                   Object msg, ChannelPromise promise) {
+                                   Object msg, ChannelPromise promise, boolean autoFlush) {
             task.ctx = ctx;
             task.msg = msg;
             task.promise = promise;
+            task.autoFlush = autoFlush;
 
             if (ESTIMATE_TASK_SIZE_ON_SUBMIT) {
                 ChannelOutboundBuffer buffer = ctx.channel().unsafe().outboundBuffer();
@@ -1057,7 +1145,11 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
                 if (ESTIMATE_TASK_SIZE_ON_SUBMIT && buffer != null) {
                     buffer.decrementPendingOutboundBytes(size);
                 }
-                write(ctx, msg, promise);
+                // Check if the promise was done already and if so not do the write as in this case
+                // we already released the msg.
+                if (!promise.isDone()) {
+                    write(ctx, msg, promise, autoFlush);
+                }
             } finally {
                 // Set to null so the GC can collect them directly
                 ctx = null;
@@ -1067,8 +1159,8 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
             }
         }
 
-        protected void write(AbstractChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
-            ctx.invokeWrite(msg, promise);
+        protected void write(AbstractChannelHandlerContext ctx, Object msg, ChannelPromise promise, boolean autoFlush) {
+            ctx.invokeWrite(msg, promise, autoFlush);
         }
     }
 
@@ -1082,9 +1174,9 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         };
 
         private static WriteTask newInstance(
-                AbstractChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                AbstractChannelHandlerContext ctx, Object msg, ChannelPromise promise, boolean autoFlush) {
             WriteTask task = RECYCLER.get();
-            init(task, ctx, msg, promise);
+            init(task, ctx, msg, promise, autoFlush);
             return task;
         }
 
@@ -1103,9 +1195,9 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         };
 
         private static WriteAndFlushTask newInstance(
-                AbstractChannelHandlerContext ctx, Object msg,  ChannelPromise promise) {
+                AbstractChannelHandlerContext ctx, Object msg,  ChannelPromise promise, boolean autoFlush) {
             WriteAndFlushTask task = RECYCLER.get();
-            init(task, ctx, msg, promise);
+            init(task, ctx, msg, promise, autoFlush);
             return task;
         }
 
@@ -1114,9 +1206,34 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         }
 
         @Override
-        public void write(AbstractChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
-            super.write(ctx, msg, promise);
+        public void write(AbstractChannelHandlerContext ctx, Object msg, ChannelPromise promise, boolean autoFlush) {
+            super.write(ctx, msg, promise, autoFlush);
             ctx.invokeFlush();
+        }
+    }
+
+    // The following code is needed to support auto flush.
+    @Override
+    public void run() {
+        if (WRITE_PENDING_UPDATER.compareAndSet(this, 1, 0)) {
+            // As we first update the write pending flag we may schedule some unnessary flushes in worst-case.
+            // This is ok as will not harm.
+            if (channel().isActive()) {
+                if (isRemoved()) {
+                    // If this handler was removed in the meantime we will do the flush from the end of the pipeline
+                    // so we at least not miss the event.
+                    pipeline.flush();
+                } else {
+                    flush();
+                }
+            }
+        }
+    }
+
+    private void scheduleFlushOnEventLoopIteration() {
+        if (WRITE_PENDING_UPDATER.compareAndSet(this, 0, 1)) {
+            // This is safe as we only call this method if this is true.
+            ((SingleThreadEventLoop) executor()).onEventLoopIteration(this);
         }
     }
 }

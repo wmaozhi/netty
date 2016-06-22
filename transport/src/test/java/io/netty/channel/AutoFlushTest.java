@@ -22,21 +22,16 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.PromiseCombiner;
 import io.netty.util.internal.ThreadLocalRandom;
-import org.junit.After;
 import org.junit.AfterClass;
-import org.junit.Before;
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameter;
-import org.junit.runners.Parameterized.Parameters;
 
 import java.net.SocketAddress;
-import java.util.Collection;
-import java.util.Collections;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class AutoFlushTest {
@@ -113,6 +108,85 @@ public class AutoFlushTest {
         writeResult.get().sync();
     }
 
+    @Test(timeout = 20000)
+    public void testFromWithinEventloopCorrectContext() throws Throwable {
+        environment.connect();
+        final AtomicReference<ChannelFuture> writeResult = new AtomicReference<ChannelFuture>();
+        final AtomicReference<Throwable> error = new AtomicReference<Throwable>();
+        environment.clientChannel.eventLoop().submit(new Runnable() {
+            @Override
+            public void run() {
+                environment.clientChannel.pipeline().addFirst(new ChannelOutboundHandlerAdapter() {
+
+                    @Override
+                    public void flush(ChannelHandlerContext ctx) throws Exception {
+                        error.set(new AssertionError("Should not call flush of this context"));
+                    }
+
+                    @Override
+                    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+                        writeResult.set(ctx.write(newDataBuffer()));
+                    }
+                });
+            }
+        }).sync();
+
+        writeResult.get().sync();
+        Throwable cause = error.get();
+        if (cause != null) {
+            throw cause;
+        }
+    }
+
+    @Test(timeout = 20000)
+    public void testOnlyOneFlushDone() throws Throwable {
+        environment.connect();
+        final AtomicReference<ChannelFuture> writeResult = new AtomicReference<ChannelFuture>();
+        final AtomicReference<ChannelFuture> writeResult2 = new AtomicReference<ChannelFuture>();
+        final AtomicReference<ChannelFuture> writeResult3 = new AtomicReference<ChannelFuture>();
+
+        final AtomicInteger flushCount = new AtomicInteger();
+        final AtomicInteger writeCount = new AtomicInteger();
+
+        environment.clientChannel.eventLoop().submit(new Runnable() {
+            @Override
+            public void run() {
+                environment.clientChannel.pipeline().addFirst(new ChannelOutboundHandlerAdapter() {
+
+                    @Override
+                    public void flush(ChannelHandlerContext ctx) throws Exception {
+                        flushCount.incrementAndGet();
+                        writeResult3.set(ctx.write(newDataBuffer()).addListener(ChannelFutureListener.CLOSE));
+                        super.flush(ctx);
+                    }
+                });
+                environment.clientChannel.pipeline().addLast(new ChannelOutboundHandlerAdapter());
+                environment.clientChannel.pipeline().addLast(new ChannelOutboundHandlerAdapter() {
+                    @Override
+                    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+                        if (writeCount.incrementAndGet() == 1) {
+                            if (flushCount.get() != 0) {
+                                promise.setFailure(new AssertionError("flushCount > 0"));
+                            }
+                        }
+                        super.write(ctx, msg, promise);
+                    }
+                });
+                writeResult.set(environment.clientChannel.write(newDataBuffer()));
+                writeResult2.set(environment.clientChannel.write(newDataBuffer()));
+            }
+        }).sync();
+
+        writeResult.get().sync();
+        writeResult2.get().sync();
+        writeResult3.get().sync();
+        environment.clientChannel.closeFuture().syncUninterruptibly();
+
+        // We do two writes but only expect one flush.
+        Assert.assertEquals(1, flushCount.get());
+        Assert.assertEquals(2, writeCount.get());
+    }
+
     private static ByteBuf newDataBuffer() {
         byte[] dataArr = new byte[32];
         ThreadLocalRandom.current().nextBytes(dataArr);
@@ -138,11 +212,17 @@ public class AutoFlushTest {
             serverBootstrap.group(serverEventloop)
                            .channel(serverChannelClass)
                            .childHandler(new ChannelInitializer<Channel>() {
-                  @Override
-                  protected void initChannel(Channel ch) throws Exception {
-                      // Nothing to do.
-                  }
-              });
+                               @Override
+                               protected void initChannel(Channel ch) throws Exception {
+                                   ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                                       @Override
+                                       public void channelRead(ChannelHandlerContext ctx, Object msg) {
+                                           // Consume message
+                                           ReferenceCountUtil.release(msg);
+                                       }
+                                   });
+                               }
+                           });
             bootstrap = new Bootstrap();
             bootstrap.option(ChannelOption.AUTO_FLUSH, true)
                      .group(clientEventloop)

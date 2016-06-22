@@ -409,11 +409,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         return pipeline.voidPromise();
     }
 
-    final void autoFlushModified(boolean autoFlush) {
-        this.autoFlush = autoFlush;
-        pipeline.autoFlushModified(autoFlush);
-    }
-
     /**
      * {@link Unsafe} implementation which sub-classes must extend and use.
      */
@@ -424,7 +419,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         private boolean inFlush0;
         /** true if the channel has never been registered, false otherwise */
         private boolean neverRegistered = true;
-        private AutoFlushTask autoFlushTask;
 
         private void assertEventLoop() {
             assert !registered || eventLoop.inEventLoop();
@@ -806,13 +800,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             }
 
             outboundBuffer.addMessage(msg, size, promise);
-
-            if (isAutoFlush()) {
-                if (autoFlushTask == null) {
-                    autoFlushTask = new AutoFlushTask(AbstractChannel.this);
-                }
-                autoFlushTask.onWrite();
-            }
         }
 
         @Override
@@ -971,10 +958,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         }
     }
 
-    private boolean isAutoFlush() {
-        return autoFlush;
-    }
-
     /**
      * Return {@code true} if the given {@link EventLoop} is compatible with this instance.
      */
@@ -1069,50 +1052,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
         boolean setClosed() {
             return super.trySuccess();
-        }
-    }
-
-    private static final class AutoFlushTask implements Runnable {
-
-        private final AbstractChannel channel;
-        private final SingleThreadEventLoop eventLoop;
-        private boolean writePending;
-        private boolean running;
-
-        AutoFlushTask(AbstractChannel channel) {
-            this.channel = channel;
-            if (channel.eventLoop() instanceof SingleThreadEventLoop) {
-                eventLoop = (SingleThreadEventLoop) channel.eventLoop();
-            } else {
-                throw new UnsupportedOperationException("Auto flush is only supported for channels using "
-                                                        + SingleThreadEventLoop.class.getName() + " eventloop. Found: "
-                                                        + channel.eventLoop().getClass().getName());
-            }
-        }
-
-        @Override
-        public void run() {
-            running = true;
-            if (writePending) {
-                channel.flush();
-                writePending = false;
-
-                if (channel.isActive() && channel.isAutoFlush()) {
-                    eventLoop.onEventLoopIteration(this);
-                }
-            }
-            running = false;
-        }
-
-        void onWrite() {
-            if (!writePending) {
-                writePending = true;
-                if (!running) {
-                    // Re-entrant (write done from flush) should not enqueue the task again as it will be done at the
-                    // end of loop.
-                    eventLoop.onEventLoopIteration(this);
-                }
-            }
         }
     }
 }
