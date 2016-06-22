@@ -27,7 +27,9 @@ import org.apache.tomcat.jni.Pool;
 import org.apache.tomcat.jni.SSL;
 import org.apache.tomcat.jni.SSLContext;
 
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Set;
@@ -44,6 +46,26 @@ public final class OpenSsl {
     private static final Throwable UNAVAILABILITY_CAUSE;
 
     private static final Set<String> AVAILABLE_CIPHER_SUITES;
+    private static final Set<String> AVAILABLE_CIPHER_SUITES_CONVERTED;
+
+    // Protocols
+    static final String PROTOCOL_SSL_V2_HELLO = "SSLv2Hello";
+    static final String PROTOCOL_SSL_V2 = "SSLv2";
+    static final String PROTOCOL_SSL_V3 = "SSLv3";
+    static final String PROTOCOL_TLS_V1 = "TLSv1";
+    static final String PROTOCOL_TLS_V1_1 = "TLSv1.1";
+    static final String PROTOCOL_TLS_V1_2 = "TLSv1.2";
+
+    private static final String[] SUPPORTED_PROTOCOLS = {
+            PROTOCOL_SSL_V2_HELLO,
+            PROTOCOL_SSL_V2,
+            PROTOCOL_SSL_V3,
+            PROTOCOL_TLS_V1,
+            PROTOCOL_TLS_V1_1,
+            PROTOCOL_TLS_V1_2
+    };
+    static final Set<String> SUPPORTED_PROTOCOLS_SET = Collections.unmodifiableSet(
+            new HashSet<String>(Arrays.asList(SUPPORTED_PROTOCOLS)));
 
     static {
         Throwable cause = null;
@@ -120,10 +142,20 @@ public final class OpenSsl {
             } finally {
                 Pool.destroy(aprPool);
             }
-
             AVAILABLE_CIPHER_SUITES = Collections.unmodifiableSet(availableCipherSuites);
+
+            final Set<String> availableCipherSuitesConverted = new LinkedHashSet<String>(
+                    AVAILABLE_CIPHER_SUITES.size() * 3);
+            for (String cipher: AVAILABLE_CIPHER_SUITES) {
+                // Included converted but also openssl cipher name
+                availableCipherSuitesConverted.add(CipherSuiteConverter.toJava(cipher, "TLS"));
+                availableCipherSuitesConverted.add(CipherSuiteConverter.toJava(cipher, "SSL"));
+                availableCipherSuitesConverted.add(cipher);
+            }
+            AVAILABLE_CIPHER_SUITES_CONVERTED = Collections.unmodifiableSet(availableCipherSuitesConverted);
         } else {
             AVAILABLE_CIPHER_SUITES = Collections.emptySet();
+            AVAILABLE_CIPHER_SUITES_CONVERTED = Collections.emptySet();
         }
     }
 
@@ -195,6 +227,14 @@ public final class OpenSsl {
      */
     public static Set<String> availableCipherSuites() {
         return AVAILABLE_CIPHER_SUITES;
+    }
+
+    /**
+     * Returns all the available cipher suites (Java-style).
+     * Please note that the returned array may include the cipher suites that are insecure or non-functional.
+     */
+    public static Set<String> availableCipherSuitesConverted() {
+        return AVAILABLE_CIPHER_SUITES_CONVERTED;
     }
 
     /**
